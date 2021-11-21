@@ -1,6 +1,8 @@
 use rand::Rng;
+use std::time::Instant;
 
 pub struct Env {
+    hz: u32, // the max num of instrs that are run a second (NOT MIN... that's impossible ofc).
     memory: [u8; 4096],
     display: [u64; 32], // 64x32 (updated @60hz) (idea: fade effect)
     program_counter: u16,
@@ -11,6 +13,8 @@ pub struct Env {
     
     delay_timer: u8, // delay timer @60hz
     sound_timer: u8, // beeps while not 0
+    last_timer_tick: Instant,
+
     variable_registers: [u8; 16], // v0-f (vf may be flag register)
     font: [u8; 5 * 16], // 5 cols, 16 rows
     skip_flag: bool, // flag to indicate if this instruction is to be skipped
@@ -28,9 +32,22 @@ mod nibble {
     }    
 }
 
+/*
+First 512 bytes (0-1ff) were meant to be for the interpreter.
+Programs are located at addr 0x200.
+Fonts are 4x5 and are popularly located at addr 0x50-0x9F
+
+(scancodes are used, below is QWERTY)
+1 2 3 4 is the mapping of 1 2 3 C
+Q W E R                   4 5 6 D
+A S D F                   7 8 9 E
+Z X C V                   A 0 B F
+*/
+
 impl Env {
-    pub fn new() -> Env {
+    pub fn new(hz: u32) -> Env {
         Env {
+            hz,
             memory: [0; 4096],
             display: [0; 32],
             program_counter: 0,
@@ -38,6 +55,7 @@ impl Env {
             stack: [0; 16],
             delay_timer: 0,
             sound_timer: 0,
+            last_timer_tick: Instant::now(),
             skip_flag: false,
             stack_next_pos: 0,
             variable_registers: [0; 16],
@@ -61,6 +79,10 @@ impl Env {
                 0xF0, 0x80, 0xF0, 0x80, 0x80  // F
             ],
         }
+    }
+
+    pub fn is_beeping(&self) -> bool {
+        self.sound_timer > 0
     }
 
     pub fn load_into_memory(&mut self) {
@@ -88,8 +110,9 @@ impl Env {
     fn call_subroutine(&mut self) {
         if (self.stack_next_pos as usize) < self.stack.len() {
             let (_, b, c, d) = self.current_instr;
-            self.stack[self.stack_next_pos as usize] = nibble::pack(0, b, c, d);
+            self.stack[self.stack_next_pos as usize] = self.program_counter;
             self.stack_next_pos += 1;
+            self.program_counter = nibble::pack(0, b, c, d);
         } else {
             panic!("Maximum levels of recursion exceeded ({})", self.stack.len());
         }
@@ -168,13 +191,14 @@ impl Env {
 
     fn register_set_register_sub_register(&mut self) {
         let (_, x, y, _) = self.current_instr;
-        self.variable_registers[x as usize] = 
-            self.variable_registers[y as usize] - self.variable_registers[x as usize];
+        let diff = self.variable_registers[y as usize].overflowing_sub(self.variable_registers[x as usize]);
+        self.variable_registers[x as usize] = diff.0;
+        self.variable_registers[15] = (!diff.1) as u8;
     }
 
     fn register_left_shift(&mut self) {
         let x = self.current_instr.1;
-        self.variable_registers[15] = self.variable_registers[x as usize] & (1 << 7);
+        self.variable_registers[15] = (self.variable_registers[x as usize] >> 7) & 1;
         self.variable_registers[x as usize] <<= 1;
     }
 
@@ -191,7 +215,7 @@ impl Env {
     fn goto_register_zero_plus_value(&mut self) {
         let (_, a, b, c) = self.current_instr;
         self.program_counter = 
-            self.variable_registers[0] as u16 + nibble::pack(0, a,b , c);
+            self.variable_registers[0] as u16 + nibble::pack(0, a, b, c);
     }
 
     fn set_register_rand_and_value(&mut self) {
@@ -201,8 +225,23 @@ impl Env {
     }
 
     fn draw_sprite(&mut self) {
-        panic!("NOT IMPLEMENTED ERROR");
-        //let (_, x, y, a) = self.current_instr;
+        let (_, x, y, h) = self.current_instr;
+        let (x, y) = (self.variable_registers[x as usize], self.variable_registers[y as usize]);
+        // this footprint tells if a certain column anywhere in the rows was flipped from 1 to 0.
+        let mut on_to_off_footprint: u64 = 0;
+        for i in 0..h {
+            let row = (
+                // First, this accesses 8 pixels starting at I, and then shifts it the distance
+                // from the 8th pixel the 64th pixel. You then shift it right x times.
+                (self.memory[self.index_register as usize + i as usize] as u64) << (64 - 8)
+            ) >> x;
+            let y = (y + i) as usize;
+            on_to_off_footprint |= self.display[y] & row;
+            self.display[y] ^= row;
+        }
+
+        // if a pixel was switched to OFF, anywhere
+        self.variable_registers[15] = (on_to_off_footprint != 0) as u8;
     }
 
     fn get_hex_press() -> u8 {
@@ -270,12 +309,25 @@ impl Env {
             self.program_counter += 2; // skip the current
         }
 
-        let (n1, n2, n3, n4) = nibble::unpack(
+        // We can update the s/d timers here b/c the clock hz is >60
+        let elapsed = self.last_timer_tick.elapsed().as_nanos();
+        if elapsed >= 1_000_000_000 / 60 {
+            if self.delay_timer > 0 {
+                self.delay_timer -= 1;
+            }
+            if self.sound_timer > 0 {
+                self.sound_timer -= 1;
+            }
+            self.last_timer_tick = Instant::now();
+        }
+
+        self.current_instr = nibble::unpack(
             self.memory[self.program_counter as usize], 
             self.memory[self.program_counter as usize + 1]
         );
-        self.current_instr = (n1, n2, n3, n4);
-        
+
+        let (n1, n2, n3, n4) = self.current_instr;
+
         //https://en.wikipedia.org/wiki/CHIP-8
         match n1 {
             0 if n2 == 0 && n3 == 0xE => match n4 {
