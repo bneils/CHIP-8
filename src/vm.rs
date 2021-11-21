@@ -1,21 +1,19 @@
-
-mod opcode {
-    pub fn matcher(code: u16) {
-        
-    }
-}
+use rand::Rng;
 
 pub struct Env {
     memory: [u8; 4096],
     display: [u64; 32], // 64x32 (updated @60hz) (idea: fade effect)
-    program_counter: usize,
-    index_register: usize, // 16-bit, ref as "I"
-    stack: [u16; 16],
+    program_counter: u16,
+    index_register: u16, // 16-bit, ref as "I"
+    
+    stack: [u16; 16], // holds the PCs for all subroutines nested above the current one in descending order.
+    stack_next_pos: u8,
+    
     delay_timer: u8, // delay timer @60hz
     sound_timer: u8, // beeps while not 0
     variable_registers: [u8; 16], // v0-f (vf may be flag register)
     font: [u8; 5 * 16], // 5 cols, 16 rows
-
+    skip_flag: bool, // flag to indicate if this instruction is to be skipped
     current_instr: (u8, u8, u8, u8), // 4 nibbles
 }
 
@@ -26,7 +24,7 @@ mod nibble {
     }
     
     pub fn pack(a: u8, b: u8, c: u8, d: u8) -> u16 {
-        (a << 12) | (b << 8) | (c << 4) | (d << 0)
+        ((a as u16) << 12) | ((b as u16) << 8) | ((c as u16) << 4) | (d as u16)
     }    
 }
 
@@ -40,8 +38,10 @@ impl Env {
             stack: [0; 16],
             delay_timer: 0,
             sound_timer: 0,
+            skip_flag: false,
+            stack_next_pos: 0,
             variable_registers: [0; 16],
-            current_instr: (0, 0, 0, 0),
+            current_instr: (0, 0, 0, 0), // tuple of nibbles
             font: [
                 0xF0, 0x90, 0x90, 0x90, 0xF0, // 0
                 0x20, 0x60, 0x20, 0x20, 0x70, // 1
@@ -68,34 +68,214 @@ impl Env {
     }
 
     fn display_clear(&mut self) {
-
+        self.display = [0; 32];
     }
 
     fn subroutine_return(&mut self) {
-
+        if self.stack_next_pos > 0 {
+            self.stack_next_pos -= 1;
+            self.program_counter = self.stack[self.stack_next_pos as usize];
+        } else {
+            panic!("Cannot RETURN with no outer subroutine to return to"); // This could just exit gracefully...
+        }
     }
 
     fn goto(&mut self) {
-
+        let (_, b, c, d) = self.current_instr;
+        self.program_counter = nibble::pack(0, b, c, d);
     }
 
     fn call_subroutine(&mut self) {
-
+        if (self.stack_next_pos as usize) < self.stack.len() {
+            let (_, b, c, d) = self.current_instr;
+            self.stack[self.stack_next_pos as usize] = nibble::pack(0, b, c, d);
+            self.stack_next_pos += 1;
+        } else {
+            panic!("Maximum levels of recursion exceeded ({})", self.stack.len());
+        }
     }
 
-    fn skip_if_eq(&mut self) {
+    fn skip_if_register_equals_value(&mut self) {
+        let (_, x, a, b) = self.current_instr;
+        self.skip_flag = 
+            self.variable_registers[x as usize] == 
+                nibble::pack(0, 0, a, b) as u8;
+    }
 
+    fn skip_if_register_not_equals_value(&mut self) {
+        let (_, x, a, b) = self.current_instr;
+        self.skip_flag = 
+            self.variable_registers[x as usize] != 
+            nibble::pack(0, 0, a, b) as u8;
+    }
+
+    fn skip_if_registers_equal(&mut self) {
+        let (_, x, y, _) = self.current_instr;
+        self.skip_flag =
+            self.variable_registers[x as usize] ==
+            self.variable_registers[y as usize];
+    }
+
+    fn register_set_value(&mut self) {
+        let (_, x, a, b) = self.current_instr;
+        self.variable_registers[x as usize] = nibble::pack(0, 0, a, b) as u8;
+    }
+
+    fn register_add_value(&mut self) {
+        let (_, x, a, b) = self.current_instr;
+        self.variable_registers[x as usize] += nibble::pack(0, 0, a, b) as u8;
+    }
+
+    fn register_set_register(&mut self) {
+        let (_, x, y, _) = self.current_instr;
+        self.variable_registers[x as usize] = self.variable_registers[y as usize];
+    }
+
+    fn register_or_register(&mut self) {
+        let (_, x, y, _) = self.current_instr;
+        self.variable_registers[x as usize] |= self.variable_registers[y as usize];
+    }
+
+    fn register_and_register(&mut self) {
+        let (_, x, y, _) = self.current_instr;
+        self.variable_registers[x as usize] &= self.variable_registers[y as usize];
+    }
+
+    fn register_xor_register(&mut self) {
+        let (_, x, y, _) = self.current_instr;
+        self.variable_registers[x as usize] ^= self.variable_registers[y as usize];
+    }
+
+    fn register_add_register(&mut self) {
+        let (_, x, y, _) = self.current_instr;
+        let sum = self.variable_registers[x as usize].overflowing_add(self.variable_registers[y as usize]);
+        self.variable_registers[x as usize] = sum.0;
+        self.variable_registers[15] = sum.1 as u8;
+    }
+
+    fn register_sub_register(&mut self) {
+        let (_, x, y, _) = self.current_instr;
+        let diff = self.variable_registers[x as usize].overflowing_sub(self.variable_registers[y as usize]);
+        self.variable_registers[x as usize] = diff.0;
+        self.variable_registers[15] = (!diff.1) as u8;
+    }
+
+    fn register_right_shift(&mut self) {
+        let (_, x, _, _) = self.current_instr;
+        self.variable_registers[15] = self.variable_registers[x as usize] & 1;
+        self.variable_registers[x as usize] >>= 1;
+    }
+
+    fn register_set_register_sub_register(&mut self) {
+        let (_, x, y, _) = self.current_instr;
+        self.variable_registers[x as usize] = 
+            self.variable_registers[y as usize] - self.variable_registers[x as usize];
+    }
+
+    fn register_left_shift(&mut self) {
+        let x = self.current_instr.1;
+        self.variable_registers[15] = self.variable_registers[x as usize] & (1 << 7);
+        self.variable_registers[x as usize] <<= 1;
+    }
+
+    fn skip_if_registers_not_equal(&mut self) {
+        let (_, x, y, _) = self.current_instr;
+        self.skip_flag = self.variable_registers[x as usize] != self.variable_registers[y as usize];
+    }
+
+    fn set_index_register(&mut self) {
+        let (_, a, b, c) = self.current_instr;
+        self.index_register = nibble::pack(0, a, b, c);
+    }
+
+    fn goto_register_zero_plus_value(&mut self) {
+        let (_, a, b, c) = self.current_instr;
+        self.program_counter = 
+            self.variable_registers[0] as u16 + nibble::pack(0, a,b , c);
+    }
+
+    fn set_register_rand_and_value(&mut self) {
+        let (_, x, a, b) = self.current_instr;
+        let n: u8 = rand::thread_rng().gen();
+        self.variable_registers[x as usize] = n & nibble::pack(0, 0, a, b) as u8;
+    }
+
+    fn draw_sprite(&mut self) {
+        panic!("NOT IMPLEMENTED ERROR");
+        //let (_, x, y, a) = self.current_instr;
+    }
+
+    fn get_hex_press() -> u8 {
+        panic!("NOT IMPLEMENTED ERROR");
+    }
+
+    fn skip_if_key_pressed_equals_register(&mut self) {
+        self.skip_flag = 
+            self.variable_registers[self.current_instr.1 as usize] == Env::get_hex_press();
+    }
+
+    fn skip_if_key_pressed_not_equals_register(&mut self) {
+        self.skip_flag =
+            self.variable_registers[self.current_instr.1 as usize] != Env::get_hex_press();
+    }
+
+    fn set_register_to_delay_timer(&mut self) {
+        self.variable_registers[self.current_instr.1 as usize] = self.delay_timer;
+    }
+
+    fn set_register_to_blocking_key(&mut self) {
+        self.variable_registers[self.current_instr.1 as usize] = Env::get_hex_press();
+    }
+
+    fn set_delay_timer_to_register(&mut self) {
+        self.delay_timer = self.variable_registers[self.current_instr.1 as usize];
+    }
+
+    fn set_sound_timer_to_register(&mut self) {
+        self.sound_timer = self.variable_registers[self.current_instr.1 as usize];
+    }
+
+    fn add_register_to_index_register(&mut self) {
+        self.index_register += self.variable_registers[self.current_instr.1 as usize] as u16;
+    }
+
+    fn set_index_register_to_sprite_location_of_register(&mut self) {
+        panic!("NOT IMPLEMENTED ERROR");
+    }
+
+    fn bcd_of_register_in_index_register(&mut self) {
+        let v = self.variable_registers[self.current_instr.1 as usize];
+        self.memory[self.index_register as usize] = v / 100;
+        self.memory[self.index_register as usize + 1] = v % 100 / 10;
+        self.memory[self.index_register as usize + 2] = v % 10;
+    }
+
+    fn store_registers_up_to_in_memory(&mut self) {
+        for i in 0..=self.current_instr.1 {
+            self.memory[self.index_register as usize + i as usize] = 
+                self.variable_registers[i as usize];
+        }
+    }
+
+    fn loads_registers_up_to_in_memory(&mut self) {
+        for i in 0..=self.current_instr.1 {
+            self.variable_registers[i as usize] =
+                self.memory[self.index_register as usize + i as usize];
+        }
     }
 
     pub fn read_instr(&mut self) {
+        if self.skip_flag {
+            self.skip_flag = false;
+            self.program_counter += 2; // skip the current
+        }
+
         let (n1, n2, n3, n4) = nibble::unpack(
-            self.memory[self.program_counter], 
-            self.memory[self.program_counter + 1]
+            self.memory[self.program_counter as usize], 
+            self.memory[self.program_counter as usize + 1]
         );
         self.current_instr = (n1, n2, n3, n4);
-
-        const ERROR_MESSAGE: &str = "unrecognized instruction";
-
+        
         //https://en.wikipedia.org/wiki/CHIP-8
         match n1 {
             0 if n2 == 0 && n3 == 0xE => match n4 {
@@ -105,8 +285,8 @@ impl Env {
             },
             1 => self.goto(),
             2 => self.call_subroutine(),
-            3 => self.skip_if_register_equal_value(),
-            4 => self.skip_if_register_not_equal_value(),
+            3 => self.skip_if_register_equals_value(),
+            4 => self.skip_if_register_not_equals_value(),
             5 if n4 == 0 => self.skip_if_registers_equal(),
             6 => self.register_set_value(),
             7 => self.register_add_value(),
@@ -134,23 +314,24 @@ impl Env {
             },
             0xF => match n3 {
                 0 => match n4 {
-                    7 => self.,
-                    0xA => ,
+                    7 => self.set_register_to_delay_timer(),
+                    0xA => self.set_register_to_blocking_key(),
                     _ => {},
                 },
                 1 => match n4 {
-                    5 => ,
-                    8 => ,
-                    0xE => ,
+                    5 => self.set_delay_timer_to_register(),
+                    8 => self.set_sound_timer_to_register(),
+                    0xE => self.add_register_to_index_register(),
                     _ => {},
                 },
-                2 if n4 == 9 => ,
-                3 if n4 == 3 => ,
-                5 if n4 == 5 => ,
-                6 if n4 == 5 => ,
+                2 if n4 == 9 => self.set_index_register_to_sprite_location_of_register(),
+                3 if n4 == 3 => self.bcd_of_register_in_index_register(),
+                5 if n4 == 5 => self.store_registers_up_to_in_memory(),
+                6 if n4 == 5 => self.loads_registers_up_to_in_memory(),
+                _ => {},
             },
             _ => {},
         };
-        self.program_counter += 2;
+        self.program_counter += 2; // each instr is 2 bytes
     }
 }
