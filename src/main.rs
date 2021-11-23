@@ -4,9 +4,9 @@ extern crate sdl2;
 use sdl2::pixels::Color;
 use sdl2::rect::Rect;
 use sdl2::event::Event;
-use sdl2::keyboard::Scancode;
 
-use std::iter::Scan;
+use std::fs::File;
+use std::io::Read;
 use std::thread;
 use std::time::Duration;
 use vm::Env;
@@ -37,45 +37,47 @@ fn main() {
         .build()
         .expect("Couldn't initialize the canvas");
 
-    let mut env = Env::new(800);
-    let mut hex_keys = [false; 16];
+    let mut env = Env::new();
+
+    let mut file = match File::open("/home/ben/Downloads/ibm.ch8") {
+        Ok(file) => file,
+        Err(err) => panic!("couldn't open file because {}", err),
+    };
+
+    let mut buf: Vec<u8> = Vec::new();
+    file.read_to_end(&mut buf).unwrap();
+    env.load_into_memory(&buf);
+
+    let hz = 540;
 
     'main: loop {
         for event in event_pump.poll_iter() {
             match event {
                 Event::Quit { .. } => break 'main,
-                Event::KeyDown { scancode, .. } => {
-                    if let Some(code) = scancode {
-                        // I dunno if there's a better way of doing this...
-                        let idx = match code {
-                            Scancode::Num0 => 0,
-                            Scancode::Num1 => 1,
-                            Scancode::Num2 => 2,
-                            Scancode::Num3 => 3,
-                            Scancode::Num4 => 4,
-                            Scancode::Num5 => 5,
-                            Scancode::Num6 => 6,
-                            Scancode::Num7 => 7,
-                            Scancode::Num8 => 8,
-                            Scancode::Num9 => 9,
-                            Scancode::A => 10,
-                            Scancode::B => 11,
-                            Scancode::C => 12,
-                            Scancode::D => 13,
-                            Scancode::E => 14,
-                            Scancode::F => 15,
-                            _ => 16,
-                        };
-                        if idx < hex_keys.len() {
-                            hex_keys[idx] = true;
-                        }
-                    }
-                }
                 _ => {},
             }
         }
 
-        canvas.present();
-        thread::sleep(Duration::new(0, 1_000_000_000u32 / 60));
+        env.read_instr(&mut event_pump);
+        if env.display_changed {
+            for y in 0..32 {
+                for x in 0..64 {
+                    let bit = (env.display[y] >> (64 - (x + 1))) as u8 & 1;
+                    canvas.set_draw_color(Color::RGB(0, 255 * bit, 0));
+                    let w = WIDTH / 64;
+                    canvas.fill_rect(Rect::new(
+                        x as i32 * w as i32, 
+                        y as i32 * w as i32, 
+                        w, w)).unwrap();
+                }
+            }
+            canvas.present();
+        }
+        
+        // Vf is changed if any pixels were set from 1 to 0.
+        //if env.variable_registers[0xf] != 0 {  
+        //}
+
+        thread::sleep(Duration::new(0, 1_000_000_000u32 / hz));
     }
 }

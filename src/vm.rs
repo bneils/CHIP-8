@@ -1,10 +1,15 @@
 use rand::Rng;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+use std::thread;
+
+use sdl2::EventPump;
+use sdl2::keyboard::Scancode;
+use sdl2::event::Event;
 
 pub struct Env {
-    hz: u32, // the max num of instrs that are run a second (NOT MIN... that's impossible ofc).
     memory: [u8; 4096],
-    display: [u64; 32], // 64x32 (updated @60hz) (idea: fade effect)
+    pub display_changed: bool,
+    pub display: [u64; 32], // 64x32 (updated @60hz) (idea: fade effect)
     program_counter: u16,
     index_register: u16, // 16-bit, ref as "I"
     
@@ -15,16 +20,17 @@ pub struct Env {
     sound_timer: u8, // beeps while not 0
     last_timer_tick: Instant,
 
-    variable_registers: [u8; 16], // v0-f (vf may be flag register)
-    font: [u8; 5 * 16], // 5 cols, 16 rows
+    pub variable_registers: [u8; 16], // v0-f (vf may be flag register)
     skip_flag: bool, // flag to indicate if this instruction is to be skipped
     current_instr: (u8, u8, u8, u8), // 4 nibbles
+
+    pub fading_pixels: [u64; 32],
 }
 
 mod nibble {
     pub fn unpack(a: u8, b: u8) -> (u8, u8, u8, u8) {
-        (a & 0b11110000, a & 0b00001111, 
-            b & 0b11110000, b & 0b00001111)
+        ((a & 0b11110000) >> 4, a & 0b00001111, 
+            (b & 0b11110000) >> 4, b & 0b00001111)
     }
     
     pub fn pack(a: u8, b: u8, c: u8, d: u8) -> u16 {
@@ -45,11 +51,14 @@ Z X C V                   A 0 B F
 */
 
 impl Env {
-    pub fn new(hz: u32) -> Env {
-        Env {
-            hz,
+    const FONT_START_LOCATION: usize = 0x50;
+    const PROGRAM_START_LOCATION: usize = 0x200;
+
+    pub fn new() -> Env {
+        let mut env = Env {
             memory: [0; 4096],
             display: [0; 32],
+            display_changed: false,
             program_counter: 0,
             index_register: 0,
             stack: [0; 16],
@@ -60,33 +69,45 @@ impl Env {
             stack_next_pos: 0,
             variable_registers: [0; 16],
             current_instr: (0, 0, 0, 0), // tuple of nibbles
-            font: [
-                0xF0, 0x90, 0x90, 0x90, 0xF0, // 0
-                0x20, 0x60, 0x20, 0x20, 0x70, // 1
-                0xF0, 0x10, 0xF0, 0x80, 0xF0, // 2
-                0xF0, 0x10, 0xF0, 0x10, 0xF0, // 3
-                0x90, 0x90, 0xF0, 0x10, 0x10, // 4
-                0xF0, 0x80, 0xF0, 0x10, 0xF0, // 5
-                0xF0, 0x80, 0xF0, 0x90, 0xF0, // 6
-                0xF0, 0x10, 0x20, 0x40, 0x40, // 7
-                0xF0, 0x90, 0xF0, 0x90, 0xF0, // 8
-                0xF0, 0x90, 0xF0, 0x10, 0xF0, // 9
-                0xF0, 0x90, 0xF0, 0x90, 0x90, // A
-                0xE0, 0x90, 0xE0, 0x90, 0xE0, // B
-                0xF0, 0x80, 0x80, 0x80, 0xF0, // C
-                0xE0, 0x90, 0x90, 0x90, 0xE0, // D
-                0xF0, 0x80, 0xF0, 0x80, 0xF0, // E
-                0xF0, 0x80, 0xF0, 0x80, 0x80  // F
-            ],
+            fading_pixels: [0; 32],
+        };
+
+        // 5 cols, 16 rows
+        const FONTS: [u8; 5 * 16] = [
+            0xF0, 0x90, 0x90, 0x90, 0xF0, // 0
+            0x20, 0x60, 0x20, 0x20, 0x70, // 1
+            0xF0, 0x10, 0xF0, 0x80, 0xF0, // 2
+            0xF0, 0x10, 0xF0, 0x10, 0xF0, // 3
+            0x90, 0x90, 0xF0, 0x10, 0x10, // 4
+            0xF0, 0x80, 0xF0, 0x10, 0xF0, // 5
+            0xF0, 0x80, 0xF0, 0x90, 0xF0, // 6
+            0xF0, 0x10, 0x20, 0x40, 0x40, // 7
+            0xF0, 0x90, 0xF0, 0x90, 0xF0, // 8
+            0xF0, 0x90, 0xF0, 0x10, 0xF0, // 9
+            0xF0, 0x90, 0xF0, 0x90, 0x90, // A
+            0xE0, 0x90, 0xE0, 0x90, 0xE0, // B
+            0xF0, 0x80, 0x80, 0x80, 0xF0, // C
+            0xE0, 0x90, 0x90, 0x90, 0xE0, // D
+            0xF0, 0x80, 0xF0, 0x80, 0xF0, // E
+            0xF0, 0x80, 0xF0, 0x80, 0x80  // F
+        ];
+
+        for i in 0..FONTS.len() {
+            env.memory[Env::FONT_START_LOCATION + i] = FONTS[i];
         }
+
+        env
     }
 
     pub fn is_beeping(&self) -> bool {
         self.sound_timer > 0
     }
 
-    pub fn load_into_memory(&mut self) {
-        
+    pub fn load_into_memory(&mut self, rom: &Vec<u8>) {
+        self.program_counter = Env::PROGRAM_START_LOCATION as u16;
+        for i in 0..rom.len() {
+            self.memory[Env::PROGRAM_START_LOCATION + i] = rom[i];
+        }
     }
 
     fn display_clear(&mut self) {
@@ -104,7 +125,7 @@ impl Env {
 
     fn goto(&mut self) {
         let (_, b, c, d) = self.current_instr;
-        self.program_counter = nibble::pack(0, b, c, d);
+        self.program_counter = nibble::pack(0, b, c, d) - 2;
     }
 
     fn call_subroutine(&mut self) {
@@ -113,6 +134,7 @@ impl Env {
             self.stack[self.stack_next_pos as usize] = self.program_counter;
             self.stack_next_pos += 1;
             self.program_counter = nibble::pack(0, b, c, d);
+            println!("{} CALL {}", self.program_counter, nibble::pack(0, b, c, d));
         } else {
             panic!("Maximum levels of recursion exceeded ({})", self.stack.len());
         }
@@ -236,34 +258,69 @@ impl Env {
                 (self.memory[self.index_register as usize + i as usize] as u64) << (64 - 8)
             ) >> x;
             let y = (y + i) as usize;
-            on_to_off_footprint |= self.display[y] & row;
+            let fading_row = self.display[y] & row;
+            self.fading_pixels[y] = fading_row;
+            on_to_off_footprint |= fading_row;
             self.display[y] ^= row;
+            self.display_changed = true;
         }
 
         // if a pixel was switched to OFF, anywhere
         self.variable_registers[15] = (on_to_off_footprint != 0) as u8;
     }
 
-    fn get_hex_press() -> u8 {
-        panic!("NOT IMPLEMENTED ERROR");
+    fn get_hex_press(&self, event_pump: &mut EventPump) -> u8 {
+        loop {
+            for event in event_pump.poll_iter() {
+                match event {
+                    Event::Quit { .. } => { panic!() },
+                    Event::KeyDown { scancode, .. } => {
+                        if let Some(code) = scancode {
+                            // I dunno if there's a better way of doing this...
+                            match code {
+                                Scancode::Num0 => return 0,
+                                Scancode::Num1 => return 1,
+                                Scancode::Num2 => return 2,
+                                Scancode::Num3 => return 3,
+                                Scancode::Num4 => return 4,
+                                Scancode::Num5 => return 5,
+                                Scancode::Num6 => return 6,
+                                Scancode::Num7 => return 7,
+                                Scancode::Num8 => return 8,
+                                Scancode::Num9 => return 9,
+                                Scancode::A => return 10,
+                                Scancode::B => return 11,
+                                Scancode::C => return 12,
+                                Scancode::D => return 13,
+                                Scancode::E => return 14,
+                                Scancode::F => return 15,
+                                _ => {},
+                            };
+                        }
+                    },
+                    _ => {},
+                }
+            }
+            thread::sleep(Duration::new(0, 1_000_000_000u32 / 60));  //60hz is all that's necessary
+        }
     }
 
-    fn skip_if_key_pressed_equals_register(&mut self) {
+    fn skip_if_key_pressed_equals_register(&mut self, pump: &mut EventPump) {
         self.skip_flag = 
-            self.variable_registers[self.current_instr.1 as usize] == Env::get_hex_press();
+            self.variable_registers[self.current_instr.1 as usize] == self.get_hex_press(pump);
     }
 
-    fn skip_if_key_pressed_not_equals_register(&mut self) {
+    fn skip_if_key_pressed_not_equals_register(&mut self, pump: &mut EventPump) {
         self.skip_flag =
-            self.variable_registers[self.current_instr.1 as usize] != Env::get_hex_press();
+            self.variable_registers[self.current_instr.1 as usize] != self.get_hex_press(pump);
     }
 
     fn set_register_to_delay_timer(&mut self) {
         self.variable_registers[self.current_instr.1 as usize] = self.delay_timer;
     }
 
-    fn set_register_to_blocking_key(&mut self) {
-        self.variable_registers[self.current_instr.1 as usize] = Env::get_hex_press();
+    fn set_register_to_blocking_key(&mut self, pump: &mut EventPump) {
+        self.variable_registers[self.current_instr.1 as usize] = self.get_hex_press(pump);
     }
 
     fn set_delay_timer_to_register(&mut self) {
@@ -279,7 +336,9 @@ impl Env {
     }
 
     fn set_index_register_to_sprite_location_of_register(&mut self) {
-        panic!("NOT IMPLEMENTED ERROR");
+        // Each sprite is 5 bytes wide, so to find its addr, you count in increments of 5
+        self.index_register = Env::FONT_START_LOCATION as u16 + 
+            self.variable_registers[self.current_instr.1 as usize] as u16 * 5;
     }
 
     fn bcd_of_register_in_index_register(&mut self) {
@@ -303,7 +362,7 @@ impl Env {
         }
     }
 
-    pub fn read_instr(&mut self) {
+    pub fn read_instr(&mut self, pump: &mut EventPump) {
         if self.skip_flag {
             self.skip_flag = false;
             self.program_counter += 2; // skip the current
@@ -328,12 +387,14 @@ impl Env {
 
         let (n1, n2, n3, n4) = self.current_instr;
 
+        let mut unrecognized_flag = false;
+
         //https://en.wikipedia.org/wiki/CHIP-8
         match n1 {
             0 if n2 == 0 && n3 == 0xE => match n4 {
                 0 => self.display_clear(),
                 0xE => self.subroutine_return(),
-                _ => {},
+                _ => unrecognized_flag = true,
             },
             1 => self.goto(),
             2 => self.call_subroutine(),
@@ -352,7 +413,7 @@ impl Env {
                 6 => self.register_right_shift(),
                 7 => self.register_set_register_sub_register(),
                 0xE => self.register_left_shift(),
-                _ => {},
+                _ => unrecognized_flag = true,
             },
             9 if n4 == 0 => self.skip_if_registers_not_equal(),
             0xA => self.set_index_register(),
@@ -360,30 +421,34 @@ impl Env {
             0xC => self.set_register_rand_and_value(),
             0xD => self.draw_sprite(),
             0xE => match n3 {
-                9 if n4 == 0xE => self.skip_if_key_pressed_equals_register(),
-                0xA if n4 == 1 => self.skip_if_key_pressed_not_equals_register(),
-                _ => {},
+                9 if n4 == 0xE => self.skip_if_key_pressed_equals_register(pump),
+                0xA if n4 == 1 => self.skip_if_key_pressed_not_equals_register(pump),
+                _ => unrecognized_flag = true,
             },
             0xF => match n3 {
                 0 => match n4 {
                     7 => self.set_register_to_delay_timer(),
-                    0xA => self.set_register_to_blocking_key(),
-                    _ => {},
+                    0xA => self.set_register_to_blocking_key(pump),
+                    _ => unrecognized_flag = true,
                 },
                 1 => match n4 {
                     5 => self.set_delay_timer_to_register(),
                     8 => self.set_sound_timer_to_register(),
                     0xE => self.add_register_to_index_register(),
-                    _ => {},
+                    _ => unrecognized_flag = true,
                 },
                 2 if n4 == 9 => self.set_index_register_to_sprite_location_of_register(),
                 3 if n4 == 3 => self.bcd_of_register_in_index_register(),
                 5 if n4 == 5 => self.store_registers_up_to_in_memory(),
                 6 if n4 == 5 => self.loads_registers_up_to_in_memory(),
-                _ => {},
+                _ => unrecognized_flag = true,
             },
-            _ => {},
+            _ => unrecognized_flag = true,
         };
+        if unrecognized_flag {
+            panic!("Unrecognized opcode ({:?}) at {}", self.current_instr, self.program_counter);
+        }
+
         self.program_counter += 2; // each instr is 2 bytes
     }
 }
