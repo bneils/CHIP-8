@@ -11,6 +11,7 @@ use std::io::Read;
 use std::thread;
 use std::time::{Instant, Duration};
 use vm::Env;
+use std::env;
 
 // The audio code below is stolen from the SDL rust example repo for square waves.
 //https://github.com/Rust-SDL2/rust-sdl2/blob/master/examples/audio-squarewave.rs
@@ -39,6 +40,16 @@ impl AudioCallback for SquareWave {
 fn main() {
     const WIDTH: u32 = 1024; // nearest multiple of 2
     const HEIGHT: u32 = WIDTH / 2;
+
+    let args: Vec<String> = env::args().collect();
+    if args.len() <= 1 {
+        panic!("No file provided to run");
+    }
+
+    let mut file = match File::open(&args[1]) {
+        Ok(file) => file,
+        Err(err) => panic!("couldn't open file because {}", err),
+    };
 
     let sdl_context = sdl2::init()
         .expect("Couldn't initialize SDL2");
@@ -87,11 +98,6 @@ fn main() {
 
     let mut env = Env::new();
 
-    let mut file = match File::open("/home/ben/Downloads/cavern.ch8") {
-        Ok(file) => file,
-        Err(err) => panic!("couldn't open file because {}", err),
-    };
-
     let mut buf: Vec<u8> = Vec::new();
     file.read_to_end(&mut buf).unwrap();
     env.load_into_memory(&buf);
@@ -109,7 +115,7 @@ fn main() {
                 _ => {},
             }
         }
-
+        
         env.read_instr(&mut event_pump);
         if env.display_changed {
             for y in 0..32 {
