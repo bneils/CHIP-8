@@ -42,12 +42,6 @@ mod nibble {
 First 512 bytes (0-1ff) were meant to be for the interpreter.
 Programs are located at addr 0x200.
 Fonts are 4x5 and are popularly located at addr 0x50-0x9F
-
-(scancodes are used, below is QWERTY)
-1 2 3 4 is the mapping of 1 2 3 C
-Q W E R                   4 5 6 D
-A S D F                   7 8 9 E
-Z X C V                   A 0 B F
 */
 
 impl Env {
@@ -134,7 +128,6 @@ impl Env {
             self.stack[self.stack_next_pos as usize] = self.program_counter;
             self.stack_next_pos += 1;
             self.program_counter = nibble::pack(0, b, c, d);
-            println!("{} CALL {}", self.program_counter, nibble::pack(0, b, c, d));
         } else {
             panic!("Maximum levels of recursion exceeded ({})", self.stack.len());
         }
@@ -270,6 +263,13 @@ impl Env {
     }
 
     fn get_hex_press(&self, event_pump: &mut EventPump) -> u8 {
+        /*
+            (scancodes are used, below is QWERTY)
+            1 2 3 4 is the mapping of 1 2 3 C
+            Q W E R                   4 5 6 D
+            A S D F                   7 8 9 E
+            Z X C V                   A 0 B F
+        */
         loop {
             for event in event_pump.poll_iter() {
                 match event {
@@ -278,22 +278,22 @@ impl Env {
                         if let Some(code) = scancode {
                             // I dunno if there's a better way of doing this...
                             match code {
-                                Scancode::Num0 => return 0,
                                 Scancode::Num1 => return 1,
                                 Scancode::Num2 => return 2,
                                 Scancode::Num3 => return 3,
-                                Scancode::Num4 => return 4,
-                                Scancode::Num5 => return 5,
-                                Scancode::Num6 => return 6,
-                                Scancode::Num7 => return 7,
-                                Scancode::Num8 => return 8,
-                                Scancode::Num9 => return 9,
-                                Scancode::A => return 10,
-                                Scancode::B => return 11,
-                                Scancode::C => return 12,
-                                Scancode::D => return 13,
-                                Scancode::E => return 14,
-                                Scancode::F => return 15,
+                                Scancode::Q => return 4,
+                                Scancode::W => return 5,
+                                Scancode::E => return 6,
+                                Scancode::A => return 7,
+                                Scancode::S => return 8,
+                                Scancode::D => return 9,
+                                Scancode::Z => return 0xA,
+                                Scancode::X => return 0,
+                                Scancode::C => return 0xB,
+                                Scancode::Num4 => return 0xC,
+                                Scancode::R => return 0xD,
+                                Scancode::F => return 0xE,
+                                Scancode::V => return 0xF,
                                 _ => {},
                             };
                         }
